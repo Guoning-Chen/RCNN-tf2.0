@@ -1,22 +1,27 @@
 from __future__ import division, print_function, absolute_import
 import numpy as np
-import selectivesearch
 import os.path
-from sklearn import svm
-from sklearn.externals import joblib
-import preprocessing_RCNN as prep
 import os
-import tools
 import cv2
+import joblib
+from sklearn import svm
+
 import config
-import tflearn
-from tflearn.layers.core import input_data, dropout, fully_connected
-from tflearn.layers.conv import conv_2d, max_pool_2d
-from tflearn.layers.normalization import local_response_normalization
-from tflearn.layers.estimator import regression
+import selectivesearch
+import RCNN_preprocessing as prep
+from RCNN_pretrain import alexnet
+import tools
 
 
 def image_proposal(img_path):
+    """
+    Produce region proposals for a given image
+
+    :param img_path: absolute path of an image
+    :return:
+        images: list of 3D arrays
+        vertices: list of tuples (left, top, right, bottom)
+    """
     img = cv2.imread(img_path)
     img_lbl, regions = selectivesearch.selective_search(
                        img, scale=500, sigma=0.9, min_size=10)
@@ -53,109 +58,96 @@ def image_proposal(img_path):
     return images, vertices
 
 
-# Load training images
-def generate_single_svm_train(train_file):
-    save_path = train_file.rsplit('.', 1)[0].strip()
+def generate_single_svm_train_data(svm_train_list):
+    """
+    prepare training data for binary SVM
+    :param svm_train_list: training list of one class
+    :return: a list of RPs (3D array) and a list of labels (scalar)
+    """
+    save_path = svm_train_list.rsplit('.', 1)[0].strip()
     if len(os.listdir(save_path)) == 0:
-        print("reading %s's svm dataset" % train_file.split('\\')[-1])
-        prep.load_train_proposals(train_file, 2, save_path, threshold=0.3, is_svm=True, save=True)
-    print("restoring svm dataset")
+        print("Generate %s's svm dataset..." % svm_train_list.split('\\')[-1])
+        prep.generate_ft_or_svm_data(svm_train_list, 2, save_path,
+                                     threshold=0.3, is_svm=True, save=True)
+    print("Load svm dataset...")
     images, labels = prep.load_from_npy(save_path)
 
     return images, labels
 
 
-# Use a already trained alexnet with the last layer redesigned
-def create_alexnet():
-    # Building 'AlexNet'
-    network = input_data(shape=[None, config.IMAGE_SIZE, config.IMAGE_SIZE, 3])
-    network = conv_2d(network, 96, 11, strides=4, activation='relu')
-    network = max_pool_2d(network, 3, strides=2)
-    network = local_response_normalization(network)
-    network = conv_2d(network, 256, 5, activation='relu')
-    network = max_pool_2d(network, 3, strides=2)
-    network = local_response_normalization(network)
-    network = conv_2d(network, 384, 3, activation='relu')
-    network = conv_2d(network, 384, 3, activation='relu')
-    network = conv_2d(network, 256, 3, activation='relu')
-    network = max_pool_2d(network, 3, strides=2)
-    network = local_response_normalization(network)
-    network = fully_connected(network, 4096, activation='tanh')
-    network = dropout(network, 0.5)
-    network = fully_connected(network, 4096, activation='tanh')
-    network = regression(network, optimizer='momentum',
-                         loss='categorical_crossentropy',
-                         learning_rate=0.001)
-    return network
-
-
-# Construct cascade svms
-def train_svms(train_file_folder, model):
-    files = os.listdir(train_file_folder)
-    svms = []
-    for train_file in files:
-        if train_file.split('.')[-1] == 'txt':
-            X, Y = generate_single_svm_train(os.path.join(train_file_folder, train_file))
+def train_svms(svm_folder, feature_extractor):
+    """
+    根据svm_folder下的训练列表（1.txt和2.txt）训练级联的svm分类器，并保存同一文件夹。
+    :param svm_folder: path of the folder which includes all files for svm
+    :param feature_extractor: AlexNet without the last layer
+    :return: list of trained cascade svm classifiers
+    """
+    files = os.listdir(svm_folder)
+    svm_classifiers = []
+    for file_name in files:
+        if file_name.split('.')[-1] == 'txt':
+            train_list_path = os.path.join(svm_folder, file_name)
+            X, Y = generate_single_svm_train_data(train_list_path)
             train_features = []
             for ind, i in enumerate(X):
                 # extract features
-                feats = model.predict([i])
-                train_features.append(feats[0])
-                tools.view_bar("extract features of %s" % train_file, ind + 1, len(X))
+                i = np.expand_dims(i, 0)  # 4D array of shape (1, 224, 224, 3)
+                featrues = feature_extractor.predict([i])
+                train_features.append(featrues[0])
+                tools.view_bar("extract features of %s" % file_name, ind + 1, len(X))
             print(' ')
-            print("feature dimension")
-            print(np.shape(train_features))
-            # SVM training
-            clf = svm.LinearSVC()
+            print("feature dimension: ", np.shape(train_features))
+            # train SVM
+            binary_svm = svm.LinearSVC()
             print("fit svm")
-            clf.fit(train_features, Y)
-            svms.append(clf)
-            joblib.dump(clf, os.path.join(train_file_folder, str(train_file.split('.')[0]) + '_svm.pkl'))
-    return svms
+            binary_svm.fit(train_features, Y)
+            svm_classifiers.append(binary_svm)
+            joblib.dump(binary_svm, os.path.join(
+                svm_folder, str(file_name.split('.')[0]) + '_svm.pkl'))
+    return svm_classifiers
 
 
 if __name__ == '__main__':
-    train_file_folder = config.TRAIN_SVM
-    img_path = './17flowers/jpg/7/image_0591.jpg'  # or './17flowers/jpg/16/****.jpg'
-    imgs, verts = image_proposal(img_path)
-    tools.show_rect(img_path, verts)
+    # an AlexNet without the last layer which serves as feature extractor
+    cnn = alexnet(num_classes=0, drop=0.5)
 
-    net = create_alexnet()
-    model = tflearn.DNN(net)
-    model.load(config.FINE_TUNE_MODEL_PATH)
+    # load fine tuned weights
+    weight_list = os.listdir(config.FINE_TUNE_WEIGHT)
+    assert weight_list is not None, 'ERROR: can not find fine-tune weights!'
+    ft_weight_path = os.path.join(config.FINE_TUNE_WEIGHT, weight_list[-1])
+    cnn.load_weights(ft_weight_path, by_name=True)  # Attention "by_name=True"
+
+    # load the cascade svm classifiers
+    svm_folder = config.SVM
     svms = []
-    for file in os.listdir(train_file_folder):
+    print("Load existed svm classifiers...", end="")
+    for file in os.listdir(svm_folder):
         if file.split('_')[-1] == 'svm.pkl':
-            svms.append(joblib.load(os.path.join(train_file_folder, file)))
+            svms.append(joblib.load(os.path.join(svm_folder, file)))
     if len(svms) == 0:
-        svms = train_svms(train_file_folder, model)
-    print("Done fitting svms")
-    features = model.predict(imgs)
-    print("predict image:")
-    print(np.shape(features))
-    results = []
-    results_label = []
-    count = 0
+        print("train svm classifiers...")
+        svms = train_svms(svm_folder=svm_folder, feature_extractor=cnn)
+    print("done!")
+
+    # draw RPs for the test image
+    test_img = './17flowers/jpg/16/image_1336.jpg'
+    rps, rects = image_proposal(test_img)
+    tools.show_rect(test_img, rects, caption='Proposed regions')
+
+    # extract features for every rp and send them to svm classifiers
+    features = cnn.predict(np.asarray(rps))
+    print("predict image: ", np.shape(features))
+    rect_results = []
+    label_results = []
+    index = 0  # index of current feature
     for f in features:
         for svm in svms:
             pred = svm.predict([f.tolist()])
-            # not background
-            if pred[0] != 0:
-                results.append(verts[count])
-                results_label.append(pred[0])
-        count += 1
+            if pred[0] != 0:  # not background
+                rect_results.append(rects[index])
+                label_results.append(pred[0])
+        index += 1
     print("result:")
-    print(results)
-    print("result label:")
-    print(results_label)
-    tools.show_rect(img_path, results)
-
-
-
-
-
-
-
-
-
-
+    for rect, label in zip(rect_results, label_results):
+        print(rect, label)
+    tools.show_rect(test_img, rect_results, caption='inference')

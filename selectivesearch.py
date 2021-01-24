@@ -232,8 +232,7 @@ def _merge_regions(r1, r2):
     return rt
 
 
-def selective_search(
-        im_orig, scale=1.0, sigma=0.8, min_size=50):
+def selective_search(im_orig, scale=1.0, sigma=0.8, min_size=50):
     '''Selective Search
 
     Parameters
@@ -255,6 +254,7 @@ def selective_search(
             [
                 {
                     'rect': (left, top, right, bottom),
+                    'size': ?
                     'labels': [...]
                 },
                 ...
